@@ -4,25 +4,30 @@ import gspread
 import pandas as pd
 
 from google.oauth2.service_account import Credentials
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from io import BytesIO
 
 
 # ============================================================
-# CONFIG
+# CONFIGURATION
 # ============================================================
 
 st.set_page_config(
     page_title="Value Scanner",
     page_icon="📊",
-    layout="wide"
+    layout="wide",
 )
 
 EDGE_MIN = 0.05
-
 CLOSING_MIN_MINUTES = 5
 CLOSING_MAX_MINUTES = 60
+
+MIN_BOOKMAKERS = 3
+OUTLIER_RATIO_MAX = 1.20
+
+MONTHLY_CREDIT_BUDGET = 500
+CREDIT_RESERVE = 100
 
 PARIS_TZ = ZoneInfo("Europe/Paris")
 
@@ -49,12 +54,12 @@ def connexion_google():
 
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive"
+        "https://www.googleapis.com/auth/drive",
     ]
 
     credentials = Credentials.from_service_account_info(
         dict(st.secrets["gcp_service_account"]),
-        scopes=scopes
+        scopes=scopes,
     )
 
     client = gspread.authorize(credentials)
@@ -64,367 +69,923 @@ def connexion_google():
 
 spreadsheet = connexion_google()
 
-sheet_scans = spreadsheet.worksheet("Scans")
-sheet_matchs = spreadsheet.worksheet("Matchs")
-sheet_signals = spreadsheet.worksheet("Signals")
+
+def get_or_create_worksheet(title, rows=3000, cols=40):
+
+    try:
+
+        return spreadsheet.worksheet(title)
+
+    except gspread.WorksheetNotFound:
+
+        return spreadsheet.add_worksheet(
+            title=title,
+            rows=rows,
+            cols=cols,
+        )
 
 
-# ============================================================
-# HEADERS
-# ============================================================
-
-MATCHS_HEADERS = [
-    "scan_id",
-    "timestamp",
-    "league",
-    "home",
-    "away",
-    "match_time",
-    "minutes_before_match",
-    "timing",
-    "outcome",
-    "fair_odd",
-    "best_odd",
-    "bookmaker",
-    "edge_pct",
-    "signal",
-    "bookmakers_used",
-    "fair_odd_historical",
-    "edge_historical_pct",
-    "signal_historical"
-]
+sheet_scans = get_or_create_worksheet("Scans")
+sheet_matchs = get_or_create_worksheet("Matchs")
+sheet_signals = get_or_create_worksheet("Signals")
 
 
 SCANS_HEADERS = [
     "scan_id",
-    "timestamp",
+    "timestamp_paris",
+    "scan_type",
     "ligues_scannées",
-    "matchs_scannés",
+    "matchs_api",
+    "matchs_closing",
     "issues_scannées",
-    "signals_count",
+    "signals_officiels",
     "credits_before",
     "credits_used",
     "credits_remaining",
     "status",
-    "error_message"
+    "error_message",
 ]
 
 
-def verifier_headers():
+MATCHS_HEADERS = [
+    "scan_id",
+    "timestamp_paris",
+    "league",
+    "event_id",
+    "home",
+    "away",
+    "match_time_paris",
+    "minutes_before_match",
+    "timing",
+    "outcome",
+    "fair_odd_v5",
+    "best_odd",
+    "bookmaker",
+    "edge_v5_pct",
+    "signal_v5",
+    "bookmakers_used",
+    "fair_odd_historical",
+    "edge_historical_pct",
+    "signal_historical",
+    "quality_status",
+    "quality_note",
+    "official_signal",
+]
 
-    if sheet_matchs.row_values(1) != MATCHS_HEADERS:
-        sheet_matchs.update(
-            "A1:R1",
-            [MATCHS_HEADERS]
+
+SIGNALS_HEADERS = [
+    "signal_id",
+    "event_id",
+    "first_scan_id",
+    "detected_at_paris",
+    "league",
+    "home",
+    "away",
+    "match_time_paris",
+    "minutes_before_match",
+    "outcome",
+    "fair_odd_historical",
+    "bet_odd",
+    "bookmaker",
+    "edge_historical_pct",
+    "quality_status",
+    "status",
+    "home_score",
+    "away_score",
+    "result",
+    "profit",
+    "closing_odd",
+    "clv_pct",
+    "last_snapshot_at_paris",
+]
+
+
+def ensure_headers(ws, required_headers):
+
+    current = ws.row_values(1)
+
+    if not current:
+
+        ws.update(
+            "A1",
+            [required_headers]
         )
 
-    if sheet_scans.row_values(1) != SCANS_HEADERS:
-        sheet_scans.update(
-            "A1:K1",
-            [SCANS_HEADERS]
+        return required_headers
+
+    missing = [
+        h
+        for h in required_headers
+        if h not in current
+    ]
+
+    if missing:
+
+        new_headers = (
+            current
+            + missing
         )
 
+        ws.update(
+            "A1",
+            [new_headers]
+        )
 
-verifier_headers()
+        return new_headers
+
+    return current
+
+
+ensure_headers(
+    sheet_scans,
+    SCANS_HEADERS
+)
+
+ensure_headers(
+    sheet_matchs,
+    MATCHS_HEADERS
+)
+
+ensure_headers(
+    sheet_signals,
+    SIGNALS_HEADERS
+)
+
+
+def append_dict_rows(
+    ws,
+    rows,
+    required_headers
+):
+
+    if not rows:
+        return
+
+    headers = ensure_headers(
+        ws,
+        required_headers
+    )
+
+    values = [
+
+        [
+            row.get(
+                header,
+                ""
+            )
+            for header in headers
+        ]
+
+        for row in rows
+    ]
+
+    ws.append_rows(
+        values,
+        value_input_option="USER_ENTERED",
+    )
+
+
+def update_sheet_row_by_key(
+    ws,
+    key_col,
+    key_value,
+    updates
+):
+
+    values = ws.get_all_values()
+
+    if not values:
+        return False
+
+    headers = values[0]
+
+    missing = [
+        col
+        for col in updates
+        if col not in headers
+    ]
+
+    if missing:
+
+        headers = ensure_headers(
+            ws,
+            headers + missing
+        )
+
+    if key_col not in headers:
+        return False
+
+    key_idx = headers.index(
+        key_col
+    )
+
+    for row_num, row in enumerate(
+        values[1:],
+        start=2
+    ):
+
+        current = (
+            row[key_idx]
+            if key_idx < len(row)
+            else ""
+        )
+
+        if str(current) == str(key_value):
+
+            for col_name, new_value in updates.items():
+
+                col_idx = (
+                    headers.index(
+                        col_name
+                    )
+                    + 1
+                )
+
+                ws.update_cell(
+                    row_num,
+                    col_idx,
+                    new_value
+                )
+
+            return True
+
+    return False
 
 
 # ============================================================
 # TEMPS
 # ============================================================
 
-def utc_to_paris(dt_utc):
-    return dt_utc.astimezone(PARIS_TZ)
+def now_utc():
+
+    return datetime.now(
+        timezone.utc
+    )
 
 
-def calcul_timing(minutes_before_match):
+def now_paris():
+
+    return now_utc().astimezone(
+        PARIS_TZ
+    )
+
+
+def parse_utc(value):
+
+    return datetime.fromisoformat(
+        value.replace(
+            "Z",
+            "+00:00"
+        )
+    )
+
+
+def format_paris(dt):
+
+    return dt.astimezone(
+        PARIS_TZ
+    ).strftime(
+        "%d/%m/%Y %H:%M:%S"
+    )
+
+
+def format_match_paris(dt):
+
+    return dt.astimezone(
+        PARIS_TZ
+    ).strftime(
+        "%d/%m/%Y %H:%M"
+    )
+
+
+def calcul_timing(
+    minutes_before_match
+):
 
     if minutes_before_match <= 0:
+
         return "STARTED"
 
-    if minutes_before_match < CLOSING_MIN_MINUTES:
+    if (
+        minutes_before_match
+        < CLOSING_MIN_MINUTES
+    ):
+
         return "TOO_LATE"
 
-    if minutes_before_match <= CLOSING_MAX_MINUTES:
+    if (
+        minutes_before_match
+        <= CLOSING_MAX_MINUTES
+    ):
+
         return "CLOSING"
 
     return "EARLY"
 
 
 # ============================================================
-# PLANNING GRATUIT
+# PLANNING
 # ============================================================
 
 @st.cache_data(ttl=300)
-def recuperer_events_ligue(league_name, sport_key):
+def fetch_events_for_league(
+    league_name,
+    sport_key
+):
 
     url = (
         "https://api.the-odds-api.com/"
         f"v4/sports/{sport_key}/events"
     )
 
-    try:
-        response = requests.get(
-            url,
-            params={"apiKey": API_KEY},
-            timeout=20
-        )
-    except Exception as e:
-        return [], str(e)
+    response = requests.get(
+        url,
+        params={
+            "apiKey": API_KEY
+        },
+        timeout=20,
+    )
 
     if response.status_code != 200:
-        return [], response.text
 
-    events = response.json()
+        return {
+            "league": league_name,
+            "events": [],
+            "error": response.text,
+        }
+
+    return {
+        "league": league_name,
+        "events": response.json(),
+        "error": None,
+    }
+
+
+def build_planning(
+    selected_leagues
+):
 
     rows = []
-
-    now_utc = datetime.now(timezone.utc)
-
-    for event in events:
-
-        commence_time = event.get("commence_time")
-
-        if not commence_time:
-            continue
-
-        try:
-            match_time_utc = datetime.fromisoformat(
-                commence_time.replace("Z", "+00:00")
-            )
-        except:
-            continue
-
-        match_time_paris = utc_to_paris(match_time_utc)
-
-        minutes_before = (
-            match_time_utc - now_utc
-        ).total_seconds() / 60
-
-        timing = calcul_timing(minutes_before)
-
-        closing_start = (
-            match_time_paris
-            - timedelta(minutes=CLOSING_MAX_MINUTES)
-        )
-
-        closing_end = (
-            match_time_paris
-            - timedelta(minutes=CLOSING_MIN_MINUTES)
-        )
-
-        rows.append({
-            "league": league_name,
-            "home": event.get("home_team", ""),
-            "away": event.get("away_team", ""),
-            "match_time_utc": match_time_utc,
-            "match_time_paris": match_time_paris,
-            "date_paris": match_time_paris.date(),
-            "kickoff": match_time_paris.strftime("%H:%M"),
-            "closing_start_dt": closing_start,
-            "closing_end_dt": closing_end,
-            "closing_window": (
-                closing_start.strftime("%H:%M")
-                + " → "
-                + closing_end.strftime("%H:%M")
-            ),
-            "minutes_before_match": round(minutes_before, 1),
-            "timing": timing
-        })
-
-    return rows, None
-
-
-def recuperer_planning(leagues):
-
-    all_events = []
     errors = []
 
-    for league_name in leagues:
+    current_utc = now_utc()
 
-        rows, error = recuperer_events_ligue(
-            league_name,
-            SPORTS[league_name]
+    for league_name in selected_leagues:
+
+        result = (
+            fetch_events_for_league(
+                league_name,
+                SPORTS[
+                    league_name
+                ],
+            )
         )
 
-        all_events.extend(rows)
+        if result["error"]:
 
-        if error:
-            errors.append(f"{league_name}: {error}")
+            errors.append(
+                f"{league_name}: "
+                f"{result['error']}"
+            )
 
-    return all_events, errors
+            continue
+
+        for event in result["events"]:
+
+            commence_time = (
+                event.get(
+                    "commence_time"
+                )
+            )
+
+            if not commence_time:
+                continue
+
+            try:
+
+                match_utc = (
+                    parse_utc(
+                        commence_time
+                    )
+                )
+
+            except Exception:
+
+                continue
+
+            minutes_before = (
+                match_utc
+                - current_utc
+            ).total_seconds() / 60
+
+            if minutes_before <= 0:
+                continue
+
+            match_paris = (
+                match_utc.astimezone(
+                    PARIS_TZ
+                )
+            )
+
+            closing_start = (
+                match_paris
+                - pd.Timedelta(
+                    minutes=(
+                        CLOSING_MAX_MINUTES
+                    )
+                )
+            )
+
+            closing_end = (
+                match_paris
+                - pd.Timedelta(
+                    minutes=(
+                        CLOSING_MIN_MINUTES
+                    )
+                )
+            )
+
+            rows.append({
+
+                "league":
+                    league_name,
+
+                "event_id":
+                    event.get(
+                        "id",
+                        ""
+                    ),
+
+                "home":
+                    event.get(
+                        "home_team",
+                        ""
+                    ),
+
+                "away":
+                    event.get(
+                        "away_team",
+                        ""
+                    ),
+
+                "match_dt_paris":
+                    match_paris,
+
+                "kickoff":
+                    match_paris.strftime(
+                        "%H:%M"
+                    ),
+
+                "minutes_before_match":
+                    round(
+                        minutes_before,
+                        1
+                    ),
+
+                "timing":
+                    calcul_timing(
+                        minutes_before
+                    ),
+
+                "closing_start":
+                    closing_start.to_pydatetime(),
+
+                "closing_window":
+                    (
+                        closing_start.strftime(
+                            "%H:%M"
+                        )
+                        + " → "
+                        + closing_end.strftime(
+                            "%H:%M"
+                        )
+                    ),
+            })
+
+    rows = sorted(
+        rows,
+        key=lambda x:
+            x["match_dt_paris"],
+    )
+
+    return rows, errors
 
 
 # ============================================================
-# CALCUL
+# VALUE CALCULATIONS
 # ============================================================
 
-def demarger(c1, cx, c2):
+def demarger(
+    c1,
+    cx,
+    c2
+):
 
     p1 = 1 / c1
     px = 1 / cx
     p2 = 1 / c2
 
-    total = p1 + px + p2
+    total = (
+        p1
+        + px
+        + p2
+    )
 
     return (
         p1 / total,
         px / total,
-        p2 / total
+        p2 / total,
     )
 
 
-# ============================================================
-# ANALYSE MATCH
-# ============================================================
+def quality_check(values):
 
-def analyser_match(match, league_name, scan_id):
+    clean = sorted(
 
-    home = match["home_team"]
-    away = match["away_team"]
+        [
+            float(x)
+            for x in values
+            if float(x) > 1
+        ],
 
-    commence_time = match["commence_time"]
-
-    match_time = datetime.fromisoformat(
-        commence_time.replace("Z", "+00:00")
+        reverse=True,
     )
 
-    now = datetime.now(timezone.utc)
+    if len(clean) < MIN_BOOKMAKERS:
 
-    minutes_before_match = (
-        match_time - now
+        return (
+            "VERIFY",
+            (
+                f"Seulement "
+                f"{len(clean)} "
+                f"bookmaker(s)"
+            ),
+        )
+
+    if (
+        len(clean) >= 2
+        and clean[1] > 0
+        and (
+            clean[0]
+            / clean[1]
+            > OUTLIER_RATIO_MAX
+        )
+    ):
+
+        return (
+            "VERIFY",
+            (
+                f"Cote "
+                f"{clean[0]:.2f} "
+                f"très éloignée "
+                f"de la 2e "
+                f"{clean[1]:.2f}"
+            ),
+        )
+
+    return (
+        "PASS",
+        ""
+    )
+
+
+def analyser_match(
+    match,
+    league_name,
+    scan_id
+):
+
+    home = (
+        match[
+            "home_team"
+        ]
+    )
+
+    away = (
+        match[
+            "away_team"
+        ]
+    )
+
+    event_id = (
+        match.get(
+            "id",
+            ""
+        )
+    )
+
+    commence_time = (
+        match[
+            "commence_time"
+        ]
+    )
+
+    match_time = (
+        parse_utc(
+            commence_time
+        )
+    )
+
+    minutes_before = (
+        match_time
+        - now_utc()
     ).total_seconds() / 60
 
-    if minutes_before_match <= 0:
-        return []
+    timing = calcul_timing(
+        minutes_before
+    )
 
-    timing = calcul_timing(minutes_before_match)
+    # OFFICIEL = CLOSING UNIQUEMENT
+    if timing != "CLOSING":
+
+        return []
 
     bookmaker_probs = []
 
-    raw_odds_home = []
-    raw_odds_draw = []
-    raw_odds_away = []
+    raw_home = []
+    raw_draw = []
+    raw_away = []
+
+    all_odds = {
+
+        home:
+            [],
+
+        "Draw":
+            [],
+
+        away:
+            [],
+    }
 
     best = {
-        home: {"odd": 0, "book": None},
-        "Draw": {"odd": 0, "book": None},
-        away: {"odd": 0, "book": None}
+
+        home: {
+            "odd": 0,
+            "book": None,
+        },
+
+        "Draw": {
+            "odd": 0,
+            "book": None,
+        },
+
+        away: {
+            "odd": 0,
+            "book": None,
+        },
     }
 
     bookmakers_used = 0
 
-    for bookmaker in match.get("bookmakers", []):
+    for bookmaker in match.get(
+        "bookmakers",
+        [],
+    ):
 
-        book_name = bookmaker.get(
-            "title",
-            "Inconnu"
+        book_name = (
+            bookmaker.get(
+                "title",
+                "Inconnu",
+            )
         )
 
-        for market in bookmaker.get("markets", []):
+        for market in bookmaker.get(
+            "markets",
+            [],
+        ):
 
-            if market.get("key") != "h2h":
+            if (
+                market.get("key")
+                != "h2h"
+            ):
+
                 continue
 
             odds = {
-                outcome["name"]: outcome["price"]
-                for outcome in market.get("outcomes", [])
+
+                outcome["name"]:
+                    float(
+                        outcome[
+                            "price"
+                        ]
+                    )
+
+                for outcome in market.get(
+                    "outcomes",
+                    [],
+                )
+
+                if (
+                    "name"
+                    in outcome
+                    and
+                    "price"
+                    in outcome
+                )
             }
 
-            if home not in odds or away not in odds:
+            if (
+                home not in odds
+                or
+                away not in odds
+            ):
+
                 continue
 
             draw_key = next(
+
                 (
                     name
                     for name in odds
-                    if name.lower() == "draw"
+                    if (
+                        name.lower()
+                        == "draw"
+                    )
                 ),
-                None
+
+                None,
             )
 
             if draw_key is None:
+
                 continue
 
-            c1 = float(odds[home])
-            cx = float(odds[draw_key])
-            c2 = float(odds[away])
+            c1 = odds[home]
+            cx = odds[draw_key]
+            c2 = odds[away]
 
-            if c1 <= 1 or cx <= 1 or c2 <= 1:
+            if (
+                c1 <= 1
+                or cx <= 1
+                or c2 <= 1
+            ):
+
                 continue
 
-            raw_odds_home.append(c1)
-            raw_odds_draw.append(cx)
-            raw_odds_away.append(c2)
+            raw_home.append(
+                c1
+            )
 
-            p1, px, p2 = demarger(
-                c1,
-                cx,
+            raw_draw.append(
+                cx
+            )
+
+            raw_away.append(
+                c2
+            )
+
+            all_odds[
+                home
+            ].append(
+                c1
+            )
+
+            all_odds[
+                "Draw"
+            ].append(
+                cx
+            )
+
+            all_odds[
+                away
+            ].append(
                 c2
             )
 
             bookmaker_probs.append(
-                (p1, px, p2)
+                demarger(
+                    c1,
+                    cx,
+                    c2,
+                )
             )
 
             bookmakers_used += 1
 
-            if c1 > best[home]["odd"]:
+            if (
+                c1
+                > best[
+                    home
+                ]["odd"]
+            ):
+
                 best[home] = {
                     "odd": c1,
-                    "book": book_name
+                    "book": book_name,
                 }
 
-            if cx > best["Draw"]["odd"]:
+            if (
+                cx
+                > best[
+                    "Draw"
+                ]["odd"]
+            ):
+
                 best["Draw"] = {
                     "odd": cx,
-                    "book": book_name
+                    "book": book_name,
                 }
 
-            if c2 > best[away]["odd"]:
+            if (
+                c2
+                > best[
+                    away
+                ]["odd"]
+            ):
+
                 best[away] = {
                     "odd": c2,
-                    "book": book_name
+                    "book": book_name,
                 }
 
     if not bookmaker_probs:
+
         return []
 
-    # ------------------------------
+    # ========================================================
     # V5
-    # ------------------------------
+    # ========================================================
 
-    consensus_home_v5 = (
-        sum(x[0] for x in bookmaker_probs)
-        / len(bookmaker_probs)
+    p_home_v5 = (
+
+        sum(
+            x[0]
+            for x in bookmaker_probs
+        )
+
+        / len(
+            bookmaker_probs
+        )
     )
 
-    consensus_draw_v5 = (
-        sum(x[1] for x in bookmaker_probs)
-        / len(bookmaker_probs)
+    p_draw_v5 = (
+
+        sum(
+            x[1]
+            for x in bookmaker_probs
+        )
+
+        / len(
+            bookmaker_probs
+        )
     )
 
-    consensus_away_v5 = (
-        sum(x[2] for x in bookmaker_probs)
-        / len(bookmaker_probs)
+    p_away_v5 = (
+
+        sum(
+            x[2]
+            for x in bookmaker_probs
+        )
+
+        / len(
+            bookmaker_probs
+        )
     )
 
     fair_v5 = {
-        home: 1 / consensus_home_v5,
-        "Draw": 1 / consensus_draw_v5,
-        away: 1 / consensus_away_v5
+
+        home:
+            1 / p_home_v5,
+
+        "Draw":
+            1 / p_draw_v5,
+
+        away:
+            1 / p_away_v5,
     }
 
-    # ------------------------------
+
+    # ========================================================
     # HISTORIQUE
-    # ------------------------------
+    # ========================================================
 
-    avg_home = sum(raw_odds_home) / len(raw_odds_home)
-    avg_draw = sum(raw_odds_draw) / len(raw_odds_draw)
-    avg_away = sum(raw_odds_away) / len(raw_odds_away)
+    avg_home = (
+        sum(raw_home)
+        / len(raw_home)
+    )
 
-    p_home_raw = 1 / avg_home
-    p_draw_raw = 1 / avg_draw
-    p_away_raw = 1 / avg_away
+    avg_draw = (
+        sum(raw_draw)
+        / len(raw_draw)
+    )
+
+    avg_away = (
+        sum(raw_away)
+        / len(raw_away)
+    )
+
+    p_home_raw = (
+        1 / avg_home
+    )
+
+    p_draw_raw = (
+        1 / avg_draw
+    )
+
+    p_away_raw = (
+        1 / avg_away
+    )
 
     total_raw = (
         p_home_raw
@@ -433,91 +994,210 @@ def analyser_match(match, league_name, scan_id):
     )
 
     fair_historical = {
-        home: 1 / (p_home_raw / total_raw),
-        "Draw": 1 / (p_draw_raw / total_raw),
-        away: 1 / (p_away_raw / total_raw)
+
+        home:
+            1
+            / (
+                p_home_raw
+                / total_raw
+            ),
+
+        "Draw":
+            1
+            / (
+                p_draw_raw
+                / total_raw
+            ),
+
+        away:
+            1
+            / (
+                p_away_raw
+                / total_raw
+            ),
     }
+
 
     rows = []
 
-    timestamp = datetime.now(
-        timezone.utc
-    ).isoformat(timespec="seconds")
+    timestamp_paris = (
+        format_paris(
+            now_utc()
+        )
+    )
 
     for outcome in [
         home,
         "Draw",
-        away
+        away,
     ]:
 
-        max_odd = best[outcome]["odd"]
+        max_odd = (
+            best[
+                outcome
+            ]["odd"]
+        )
 
         if max_odd == 0:
+
             continue
 
-        fair_odd_v5 = fair_v5[outcome]
-        fair_odd_hist = fair_historical[outcome]
+        fair_odd_v5 = (
+            fair_v5[
+                outcome
+            ]
+        )
+
+        fair_odd_hist = (
+            fair_historical[
+                outcome
+            ]
+        )
 
         edge_v5 = (
-            max_odd / fair_odd_v5
+            max_odd
+            / fair_odd_v5
         ) - 1
 
-        edge_historical = (
-            max_odd / fair_odd_hist
+        edge_hist = (
+            max_odd
+            / fair_odd_hist
         ) - 1
+
+        (
+            quality_status,
+            quality_note
+        ) = quality_check(
+            all_odds[
+                outcome
+            ]
+        )
+
+        hist_signal = (
+            edge_hist
+            >= EDGE_MIN
+        )
+
+        official = (
+            hist_signal
+            and
+            quality_status
+            == "PASS"
+        )
 
         rows.append({
-            "scan_id": scan_id,
-            "timestamp": timestamp,
-            "league": league_name,
-            "home": home,
-            "away": away,
-            "match_time": commence_time,
-            "minutes_before_match": round(
-                minutes_before_match,
-                1
-            ),
-            "timing": timing,
-            "outcome": outcome,
-            "fair_odd": round(
-                fair_odd_v5,
-                4
-            ),
-            "best_odd": round(
-                max_odd,
-                4
-            ),
-            "bookmaker": best[outcome]["book"],
-            "edge_pct": round(
-                edge_v5 * 100,
-                2
-            ),
-            "signal": (
-                "YES"
-                if edge_v5 >= EDGE_MIN
-                else "NO"
-            ),
-            "bookmakers_used": bookmakers_used,
-            "fair_odd_historical": round(
-                fair_odd_hist,
-                4
-            ),
-            "edge_historical_pct": round(
-                edge_historical * 100,
-                2
-            ),
-            "signal_historical": (
-                "YES"
-                if edge_historical >= EDGE_MIN
-                else "NO"
-            )
+
+            "scan_id":
+                scan_id,
+
+            "timestamp_paris":
+                timestamp_paris,
+
+            "league":
+                league_name,
+
+            "event_id":
+                event_id,
+
+            "home":
+                home,
+
+            "away":
+                away,
+
+            "match_time_paris":
+                format_match_paris(
+                    match_time
+                ),
+
+            "minutes_before_match":
+                round(
+                    minutes_before,
+                    1
+                ),
+
+            "timing":
+                timing,
+
+            "outcome":
+                outcome,
+
+            "fair_odd_v5":
+                round(
+                    fair_odd_v5,
+                    4
+                ),
+
+            "best_odd":
+                round(
+                    max_odd,
+                    4
+                ),
+
+            "bookmaker":
+                best[
+                    outcome
+                ]["book"],
+
+            "edge_v5_pct":
+                round(
+                    edge_v5
+                    * 100,
+                    2
+                ),
+
+            "signal_v5":
+                (
+                    "YES"
+                    if (
+                        edge_v5
+                        >= EDGE_MIN
+                    )
+                    else "NO"
+                ),
+
+            "bookmakers_used":
+                bookmakers_used,
+
+            "fair_odd_historical":
+                round(
+                    fair_odd_hist,
+                    4
+                ),
+
+            "edge_historical_pct":
+                round(
+                    edge_hist
+                    * 100,
+                    2
+                ),
+
+            "signal_historical":
+                (
+                    "YES"
+                    if hist_signal
+                    else "NO"
+                ),
+
+            "quality_status":
+                quality_status,
+
+            "quality_note":
+                quality_note,
+
+            "official_signal":
+                (
+                    "YES"
+                    if official
+                    else "NO"
+                ),
         })
 
     return rows
 
 
 # ============================================================
-# API ODDS
+# SCAN ODDS
 # ============================================================
 
 def scanner_ligue(
@@ -532,193 +1212,410 @@ def scanner_ligue(
     )
 
     params = {
-        "apiKey": API_KEY,
-        "regions": "fr",
-        "markets": "h2h",
-        "oddsFormat": "decimal"
+
+        "apiKey":
+            API_KEY,
+
+        "regions":
+            "fr",
+
+        "markets":
+            "h2h",
+
+        "oddsFormat":
+            "decimal",
     }
 
     response = requests.get(
         url,
         params=params,
-        timeout=20
+        timeout=20,
     )
 
-    remaining = response.headers.get(
-        "x-requests-remaining"
-    )
+    result = {
 
-    used = response.headers.get(
-        "x-requests-used"
-    )
+        "rows":
+            [],
 
-    last = response.headers.get(
-        "x-requests-last"
-    )
+        "matches_api":
+            0,
+
+        "remaining":
+            response.headers.get(
+                "x-requests-remaining"
+            ),
+
+        "last":
+            response.headers.get(
+                "x-requests-last"
+            ),
+
+        "error":
+            None,
+    }
 
     if response.status_code != 200:
 
-        return {
-            "rows": [],
-            "matches": 0,
-            "remaining": remaining,
-            "used": used,
-            "last": last,
-            "error": response.text
-        }
+        result["error"] = (
+            response.text
+        )
+
+        return result
 
     matches = response.json()
 
-    rows = []
+    result["matches_api"] = (
+        len(matches)
+    )
 
     for match in matches:
 
-        rows.extend(
+        result["rows"].extend(
+
             analyser_match(
                 match,
                 league_name,
-                scan_id
+                scan_id,
             )
         )
 
-    return {
-        "rows": rows,
-        "matches": len(matches),
-        "remaining": remaining,
-        "used": used,
-        "last": last,
-        "error": None
-    }
+    return result
 
 
 # ============================================================
-# GOOGLE SHEETS HELPERS
+# SIGNALS
 # ============================================================
 
-def enregistrer_matchs(rows):
+def load_signals_records():
 
-    if not rows:
-        return
-
-    data = []
-
-    for r in rows:
-
-        data.append([
-            r["scan_id"],
-            r["timestamp"],
-            r["league"],
-            r["home"],
-            r["away"],
-            r["match_time"],
-            r["minutes_before_match"],
-            r["timing"],
-            r["outcome"],
-            r["fair_odd"],
-            r["best_odd"],
-            r["bookmaker"],
-            r["edge_pct"],
-            r["signal"],
-            r["bookmakers_used"],
-            r["fair_odd_historical"],
-            r["edge_historical_pct"],
-            r["signal_historical"]
-        ])
-
-    sheet_matchs.append_rows(
-        data,
-        value_input_option="USER_ENTERED"
+    return (
+        sheet_signals
+        .get_all_records()
     )
 
 
-def recuperer_signal_keys():
+def signal_key(
+    event_id,
+    outcome
+):
 
-    values = sheet_signals.get_all_records()
+    return (
+        f"{event_id}|"
+        f"{outcome}"
+    )
 
-    keys = set()
 
-    for row in values:
+def make_signal_id(
+    event_id,
+    outcome
+):
 
-        key = (
-            f"{row.get('league')}|"
-            f"{row.get('home')}|"
-            f"{row.get('away')}|"
-            f"{row.get('match_time')}|"
-            f"{row.get('outcome')}|"
-            f"{row.get('timing')}"
+    safe_outcome = (
+
+        str(outcome)
+        .replace(
+            " ",
+            ""
+        )
+        .replace(
+            "/",
+            ""
+        )
+    )
+
+    return (
+
+        f"SIG-"
+        f"{str(event_id)[:8]}-"
+        f"{safe_outcome[:12]}"
+    )
+
+
+def upsert_signals(
+    closing_rows
+):
+
+    existing = (
+        load_signals_records()
+    )
+
+    existing_by_key = {
+
+        signal_key(
+            str(
+                row.get(
+                    "event_id",
+                    ""
+                )
+            ),
+            str(
+                row.get(
+                    "outcome",
+                    ""
+                )
+            ),
+        ):
+            row
+
+        for row in existing
+
+        if (
+            row.get(
+                "event_id"
+            )
+            and
+            row.get(
+                "outcome"
+            )
+        )
+    }
+
+    created = 0
+    updated = 0
+
+    for row in closing_rows:
+
+        key = signal_key(
+            row[
+                "event_id"
+            ],
+            row[
+                "outcome"
+            ],
         )
 
-        keys.add(key)
+        # ----------------------------------------------------
+        # Signal déjà existant
+        # -> mise à jour CLV
+        # ----------------------------------------------------
 
-    return keys
+        if key in existing_by_key:
 
+            signal = (
+                existing_by_key[
+                    key
+                ]
+            )
 
-def enregistrer_signals(rows):
+            bet_odd = float(
+                signal.get(
+                    "bet_odd"
+                )
+                or 0
+            )
 
-    signals = [
-        x
-        for x in rows
-        if x["signal_historical"] == "YES"
-    ]
+            closing_odd = float(
+                row[
+                    "best_odd"
+                ]
+            )
 
-    if not signals:
-        return 0
+            clv_pct = (
 
-    existing_keys = recuperer_signal_keys()
+                round(
+                    (
+                        bet_odd
+                        / closing_odd
+                        - 1
+                    )
+                    * 100,
+                    2,
+                )
 
-    new_rows = []
+                if (
+                    bet_odd > 0
+                    and
+                    closing_odd > 0
+                )
 
-    for r in signals:
+                else ""
+            )
 
-        key = (
-            f"{r['league']}|"
-            f"{r['home']}|"
-            f"{r['away']}|"
-            f"{r['match_time']}|"
-            f"{r['outcome']}|"
-            f"{r['timing']}"
-        )
+            update_sheet_row_by_key(
+                sheet_signals,
+                "signal_id",
+                signal[
+                    "signal_id"
+                ],
+                {
+                    "closing_odd":
+                        closing_odd,
 
-        if key in existing_keys:
+                    "clv_pct":
+                        clv_pct,
+
+                    "last_snapshot_at_paris":
+                        row[
+                            "timestamp_paris"
+                        ],
+                },
+            )
+
+            updated += 1
+
             continue
 
-        existing_keys.add(key)
 
-        new_rows.append([
-            r["scan_id"],
-            r["timestamp"],
-            r["league"],
-            r["home"],
-            r["away"],
-            r["match_time"],
-            r["minutes_before_match"],
-            r["timing"],
-            r["outcome"],
-            r["fair_odd_historical"],
-            r["best_odd"],
-            r["bookmaker"],
-            r["edge_historical_pct"],
-            "",
-            "",
-            "",
-            ""
-        ])
+        # ----------------------------------------------------
+        # Pas de signal officiel
+        # ----------------------------------------------------
 
-    if new_rows:
+        if (
+            row[
+                "official_signal"
+            ]
+            != "YES"
+        ):
 
-        sheet_signals.append_rows(
-            new_rows,
-            value_input_option="USER_ENTERED"
+            continue
+
+
+        # ----------------------------------------------------
+        # Nouveau signal
+        # ----------------------------------------------------
+
+        signal_id = (
+            make_signal_id(
+                row[
+                    "event_id"
+                ],
+                row[
+                    "outcome"
+                ],
+            )
         )
 
-    return len(new_rows)
+        new_signal = {
+
+            "signal_id":
+                signal_id,
+
+            "event_id":
+                row[
+                    "event_id"
+                ],
+
+            "first_scan_id":
+                row[
+                    "scan_id"
+                ],
+
+            "detected_at_paris":
+                row[
+                    "timestamp_paris"
+                ],
+
+            "league":
+                row[
+                    "league"
+                ],
+
+            "home":
+                row[
+                    "home"
+                ],
+
+            "away":
+                row[
+                    "away"
+                ],
+
+            "match_time_paris":
+                row[
+                    "match_time_paris"
+                ],
+
+            "minutes_before_match":
+                row[
+                    "minutes_before_match"
+                ],
+
+            "outcome":
+                row[
+                    "outcome"
+                ],
+
+            "fair_odd_historical":
+                row[
+                    "fair_odd_historical"
+                ],
+
+            "bet_odd":
+                row[
+                    "best_odd"
+                ],
+
+            "bookmaker":
+                row[
+                    "bookmaker"
+                ],
+
+            "edge_historical_pct":
+                row[
+                    "edge_historical_pct"
+                ],
+
+            "quality_status":
+                row[
+                    "quality_status"
+                ],
+
+            "status":
+                "OPEN",
+
+            "home_score":
+                "",
+
+            "away_score":
+                "",
+
+            "result":
+                "",
+
+            "profit":
+                "",
+
+            "closing_odd":
+                row[
+                    "best_odd"
+                ],
+
+            "clv_pct":
+                0,
+
+            "last_snapshot_at_paris":
+                row[
+                    "timestamp_paris"
+                ],
+        }
+
+        append_dict_rows(
+            sheet_signals,
+            [
+                new_signal
+            ],
+            SIGNALS_HEADERS,
+        )
+
+        existing_by_key[
+            key
+        ] = new_signal
+
+        created += 1
+
+    return (
+        created,
+        updated
+    )
 
 
 # ============================================================
-# SCAN PERSISTANT
+# EXECUTION SCAN
 # ============================================================
 
-def executer_scan(leagues_to_scan):
+def executer_scan(
+    leagues_to_scan
+):
 
     if not leagues_to_scan:
 
@@ -728,290 +1625,376 @@ def executer_scan(leagues_to_scan):
 
         return
 
-    scan_time = datetime.now(
-        timezone.utc
+
+    scan_time = (
+        now_utc()
     )
 
     scan_id = (
+
         "SCAN-"
+
         + scan_time.strftime(
             "%Y%m%d-%H%M%S"
         )
     )
 
-    # --------------------------------------------------------
-    # IMPORTANT :
-    # enregistrer STARTED immédiatement
-    # --------------------------------------------------------
 
-    scan_row = [
-        scan_id,
-        scan_time.isoformat(
-            timespec="seconds"
-        ),
-        len(leagues_to_scan),
-        0,
-        0,
-        0,
-        "",
-        0,
-        "",
-        "STARTED",
-        ""
-    ]
+    started_row = {
 
-    sheet_scans.append_row(
-        scan_row,
-        value_input_option="USER_ENTERED"
+        "scan_id":
+            scan_id,
+
+        "timestamp_paris":
+            format_paris(
+                scan_time
+            ),
+
+        "scan_type":
+            "CLOSING",
+
+        "ligues_scannées":
+            len(
+                leagues_to_scan
+            ),
+
+        "matchs_api":
+            0,
+
+        "matchs_closing":
+            0,
+
+        "issues_scannées":
+            0,
+
+        "signals_officiels":
+            0,
+
+        "credits_before":
+            "",
+
+        "credits_used":
+            0,
+
+        "credits_remaining":
+            "",
+
+        "status":
+            "STARTED",
+
+        "error_message":
+            "",
+    }
+
+
+    append_dict_rows(
+        sheet_scans,
+        [
+            started_row
+        ],
+        SCANS_HEADERS,
     )
 
-    # On récupère la ligne physique créée
-    scan_sheet_row = len(
-        sheet_scans.get_all_values()
-    )
 
     all_rows = []
+    errors = []
 
-    total_matches = 0
-    credits_after = None
-    credits_used_scan = 0
+    matches_api = 0
+    credits_used = 0
+    credits_remaining = None
 
-    error_messages = []
 
     try:
 
         with st.spinner(
-            "Récupération des cotes..."
+            "Scan des cotes CLOSING..."
         ):
 
-            for league_name in leagues_to_scan:
+            for league_name in (
+                leagues_to_scan
+            ):
 
                 try:
 
-                    result = scanner_ligue(
-                        league_name,
-                        SPORTS[league_name],
-                        scan_id
+                    result = (
+                        scanner_ligue(
+                            league_name,
+                            SPORTS[
+                                league_name
+                            ],
+                            scan_id,
+                        )
                     )
 
-                except Exception as e:
+                except Exception as exc:
 
-                    error_messages.append(
-                        f"{league_name}: {str(e)}"
+                    errors.append(
+                        f"{league_name}: "
+                        f"{exc}"
                     )
 
                     continue
 
+
+                matches_api += (
+                    result[
+                        "matches_api"
+                    ]
+                )
+
+                all_rows.extend(
+                    result[
+                        "rows"
+                    ]
+                )
+
+                try:
+
+                    credits_used += int(
+                        result[
+                            "last"
+                        ]
+                        or 0
+                    )
+
+                except Exception:
+
+                    pass
+
+
+                try:
+
+                    credits_remaining = int(
+                        result[
+                            "remaining"
+                        ]
+                    )
+
+                except Exception:
+
+                    pass
+
+
                 if result["error"]:
 
-                    error_messages.append(
+                    errors.append(
                         f"{league_name}: "
                         f"{result['error']}"
                     )
 
-                    continue
 
-                total_matches += (
-                    result["matches"]
-                )
+        unique_closing_matches = {
 
-                all_rows.extend(
-                    result["rows"]
-                )
+            (
+                row[
+                    "league"
+                ],
 
-                try:
-                    credits_used_scan += int(
-                        result["last"]
-                    )
-                except:
-                    pass
-
-                try:
-                    credits_after = int(
-                        result["remaining"]
-                    )
-                except:
-                    pass
-
-        credits_before = None
-
-        if credits_after is not None:
-
-            credits_before = (
-                credits_after
-                + credits_used_scan
+                row[
+                    "event_id"
+                ],
             )
 
-        # ----------------------------------------------------
-        # Sauvegarde Matchs
-        # ----------------------------------------------------
+            for row in all_rows
+        }
 
-        enregistrer_matchs(
-            all_rows
-        )
 
-        # ----------------------------------------------------
-        # Sauvegarde Signals
-        # ----------------------------------------------------
+        official_rows = [
 
-        new_signals = enregistrer_signals(
-            all_rows
-        )
+            row
 
-        signal_hist_count = sum(
-            1
-            for r in all_rows
-            if r["signal_historical"] == "YES"
-        )
+            for row in all_rows
 
-        issues_count = len(
-            all_rows
-        )
+            if (
+                row[
+                    "official_signal"
+                ]
+                == "YES"
+            )
+        ]
 
-        # ----------------------------------------------------
-        # Mise à jour ligne Scans
-        # ----------------------------------------------------
 
-        status = (
-            "COMPLETE"
-            if not error_messages
-            else "PARTIAL"
-        )
+        credits_before = (
 
-        error_text = (
-            " | ".join(error_messages)
-            if error_messages
+            credits_remaining
+            + credits_used
+
+            if (
+                credits_remaining
+                is not None
+            )
+
             else ""
         )
 
-        update_values = [[
-            scan_id,
-            scan_time.isoformat(
-                timespec="seconds"
-            ),
-            len(leagues_to_scan),
-            total_matches,
-            issues_count,
-            signal_hist_count,
-            (
-                credits_before
-                if credits_before is not None
-                else ""
-            ),
-            credits_used_scan,
-            (
-                credits_after
-                if credits_after is not None
-                else ""
-            ),
-            status,
-            error_text
-        ]]
 
-        sheet_scans.update(
-            f"A{scan_sheet_row}:K{scan_sheet_row}",
-            update_values
+        append_dict_rows(
+            sheet_matchs,
+            all_rows,
+            MATCHS_HEADERS,
         )
 
-        # ----------------------------------------------------
-        # Affichage
-        # ----------------------------------------------------
+
+        (
+            created,
+            updated
+        ) = upsert_signals(
+            all_rows
+        )
+
+
+        status = (
+
+            "COMPLETE"
+
+            if not errors
+
+            else "PARTIAL"
+        )
+
+
+        update_sheet_row_by_key(
+            sheet_scans,
+            "scan_id",
+            scan_id,
+            {
+
+                "matchs_api":
+                    matches_api,
+
+                "matchs_closing":
+                    len(
+                        unique_closing_matches
+                    ),
+
+                "issues_scannées":
+                    len(
+                        all_rows
+                    ),
+
+                "signals_officiels":
+                    len(
+                        official_rows
+                    ),
+
+                "credits_before":
+                    credits_before,
+
+                "credits_used":
+                    credits_used,
+
+                "credits_remaining":
+                    (
+                        credits_remaining
+
+                        if (
+                            credits_remaining
+                            is not None
+                        )
+
+                        else ""
+                    ),
+
+                "status":
+                    status,
+
+                "error_message":
+                    " | ".join(
+                        errors
+                    ),
+            },
+        )
+
 
         st.success(
-            f"Scan enregistré : {scan_id}"
+            f"Scan enregistré : "
+            f"{scan_id}"
         )
 
-        c1, c2, c3, c4 = st.columns(4)
+
+        c1, c2, c3, c4 = (
+            st.columns(4)
+        )
+
 
         c1.metric(
             "Matchs API",
-            total_matches
+            matches_api,
         )
 
-        closing_rows = [
-            r
-            for r in all_rows
-            if r["timing"] == "CLOSING"
-        ]
 
         c2.metric(
             "Matchs CLOSING",
             len(
-                set(
-                    (
-                        r["league"],
-                        r["home"],
-                        r["away"],
-                        r["match_time"]
-                    )
-                    for r in closing_rows
-                )
-            )
+                unique_closing_matches
+            ),
         )
+
 
         c3.metric(
-            "Signals historiques",
-            signal_hist_count
+            "Signals officiels",
+            len(
+                official_rows
+            ),
         )
 
-        closing_signal_rows = [
-            r
-            for r in closing_rows
-            if r["signal_historical"] == "YES"
-        ]
 
         c4.metric(
-            "Signals CLOSING",
-            len(closing_signal_rows)
+            "Nouveaux paper bets",
+            created,
         )
 
-        st.subheader(
-            "💳 Crédits"
+
+        c1, c2, c3 = (
+            st.columns(3)
         )
 
-        c1, c2, c3 = st.columns(3)
 
         c1.metric(
-            "Avant",
+            "Crédits avant",
             (
                 credits_before
-                if credits_before is not None
+                if credits_before != ""
                 else "?"
-            )
+            ),
         )
+
 
         c2.metric(
-            "Utilisés",
-            credits_used_scan
+            "Crédits utilisés",
+            credits_used,
         )
+
 
         c3.metric(
-            "Restants",
+            "Crédits restants",
             (
-                credits_after
-                if credits_after is not None
+                credits_remaining
+
+                if (
+                    credits_remaining
+                    is not None
+                )
+
                 else "?"
-            )
+            ),
         )
 
-        st.subheader(
-            "🎯 Matchs CLOSING"
-        )
 
-        if not closing_rows:
+        if all_rows:
 
-            st.info(
-                "Aucun match CLOSING."
+            df = pd.DataFrame(
+                all_rows
             )
 
-        else:
 
-            closing_df = pd.DataFrame(
-                closing_rows
+            st.subheader(
+                "🎯 Détail CLOSING"
             )
+
 
             st.dataframe(
-                closing_df[
+                df[
                     [
                         "league",
                         "home",
@@ -1022,38 +2005,880 @@ def executer_scan(leagues_to_scan):
                         "best_odd",
                         "bookmaker",
                         "edge_historical_pct",
-                        "signal_historical"
+                        "quality_status",
+                        "quality_note",
+                        "official_signal",
                     ]
                 ],
                 use_container_width=True,
-                hide_index=True
+                hide_index=True,
             )
 
-        st.caption(
-            f"Nouveaux signaux ajoutés : "
-            f"{new_signals}"
+
+            official_df = df[
+                df[
+                    "official_signal"
+                ]
+                == "YES"
+            ]
+
+
+            st.subheader(
+                "🚨 Values officielles"
+            )
+
+
+            if official_df.empty:
+
+                st.info(
+                    "Aucune value officielle ≥5 %."
+                )
+
+            else:
+
+                st.dataframe(
+                    official_df,
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+
+        else:
+
+            st.info(
+                (
+                    "Aucun match dans la "
+                    "fenêtre CLOSING "
+                    "5–60 min."
+                )
+            )
+
+
+        if updated:
+
+            st.caption(
+                (
+                    f"{updated} signal(aux) "
+                    "existant(s) ont reçu "
+                    "un nouveau snapshot."
+                )
+            )
+
+
+    except Exception as exc:
+
+        update_sheet_row_by_key(
+            sheet_scans,
+            "scan_id",
+            scan_id,
+            {
+
+                "status":
+                    "ERROR",
+
+                "error_message":
+                    str(exc),
+            },
         )
 
-    except Exception as e:
-
-        error_text = str(e)
-
-        sheet_scans.update(
-            f"J{scan_sheet_row}:K{scan_sheet_row}",
-            [[
-                "ERROR",
-                error_text
-            ]]
-        )
 
         st.error(
-            "Le scan a rencontré une erreur, "
-            "mais il a été enregistré dans Sheets."
+            (
+                "Le scan a rencontré "
+                "une erreur, mais sa trace "
+                "est conservée."
+            )
         )
 
+
         st.code(
-            error_text
+            str(exc)
         )
+
+
+# ============================================================
+# BUDGET API
+# ============================================================
+
+def get_budget_stats():
+
+    scans = pd.DataFrame(
+        sheet_scans.get_all_records()
+    )
+
+
+    stats = {
+
+        "remaining":
+            None,
+
+        "today_used":
+            0,
+
+        "month_used":
+            0,
+
+        "avg_per_active_day":
+            0,
+
+        "usable_after_reserve":
+            None,
+    }
+
+
+    if scans.empty:
+
+        return stats
+
+
+    if (
+        "credits_used"
+        in scans.columns
+    ):
+
+        scans[
+            "credits_used_num"
+        ] = (
+
+            pd.to_numeric(
+                scans[
+                    "credits_used"
+                ],
+                errors="coerce",
+            )
+            .fillna(0)
+        )
+
+    else:
+
+        scans[
+            "credits_used_num"
+        ] = 0
+
+
+    if (
+        "timestamp_paris"
+        not in scans.columns
+    ):
+
+        return stats
+
+
+    parsed = pd.to_datetime(
+        scans[
+            "timestamp_paris"
+        ],
+        format=(
+            "%d/%m/%Y %H:%M:%S"
+        ),
+        errors="coerce",
+    )
+
+
+    scans[
+        "_parsed"
+    ] = parsed
+
+
+    today = (
+        now_paris().date()
+    )
+
+
+    current_month = (
+        today.year,
+        today.month,
+    )
+
+
+    today_mask = (
+
+        scans[
+            "_parsed"
+        ].dt.date
+
+        == today
+    )
+
+
+    month_mask = (
+
+        (
+            scans[
+                "_parsed"
+            ].dt.year
+
+            == current_month[0]
+        )
+
+        &
+
+        (
+            scans[
+                "_parsed"
+            ].dt.month
+
+            == current_month[1]
+        )
+    )
+
+
+    stats[
+        "today_used"
+    ] = int(
+
+        scans.loc[
+            today_mask,
+            "credits_used_num",
+        ].sum()
+    )
+
+
+    stats[
+        "month_used"
+    ] = int(
+
+        scans.loc[
+            month_mask,
+            "credits_used_num",
+        ].sum()
+    )
+
+
+    active_days = (
+
+        scans.loc[
+            (
+                month_mask
+                &
+                (
+                    scans[
+                        "credits_used_num"
+                    ]
+                    > 0
+                )
+            ),
+            "_parsed",
+        ]
+        .dt.date
+        .nunique()
+    )
+
+
+    if active_days:
+
+        stats[
+            "avg_per_active_day"
+        ] = (
+
+            stats[
+                "month_used"
+            ]
+
+            / active_days
+        )
+
+
+    if (
+        "credits_remaining"
+        in scans.columns
+    ):
+
+        remaining_series = (
+
+            pd.to_numeric(
+                scans[
+                    "credits_remaining"
+                ],
+                errors="coerce",
+            )
+            .dropna()
+        )
+
+
+        if (
+            not remaining_series.empty
+        ):
+
+            stats[
+                "remaining"
+            ] = int(
+                remaining_series.iloc[
+                    -1
+                ]
+            )
+
+
+    if (
+        stats[
+            "remaining"
+        ]
+        is not None
+    ):
+
+        stats[
+            "usable_after_reserve"
+        ] = max(
+
+            0,
+
+            stats[
+                "remaining"
+            ]
+            - CREDIT_RESERVE,
+        )
+
+
+    return stats
+
+
+def afficher_budget():
+
+    stats = (
+        get_budget_stats()
+    )
+
+
+    st.subheader(
+        "💳 Budget API"
+    )
+
+
+    c1, c2, c3, c4 = (
+        st.columns(4)
+    )
+
+
+    c1.metric(
+        "Crédits restants",
+        (
+            stats[
+                "remaining"
+            ]
+
+            if (
+                stats[
+                    "remaining"
+                ]
+                is not None
+            )
+
+            else "?"
+        ),
+    )
+
+
+    c2.metric(
+        "Utilisés aujourd'hui",
+        stats[
+            "today_used"
+        ],
+    )
+
+
+    c3.metric(
+        "Utilisés ce mois",
+        stats[
+            "month_used"
+        ],
+    )
+
+
+    c4.metric(
+        "Moyenne / jour actif",
+        (
+            f"{stats['avg_per_active_day']:.1f}"
+        ),
+    )
+
+
+    if (
+        stats[
+            "remaining"
+        ]
+        is not None
+    ):
+
+        remaining = (
+            stats[
+                "remaining"
+            ]
+        )
+
+
+        if remaining > 200:
+
+            state = "🟢"
+
+        elif remaining > 100:
+
+            state = "🟠"
+
+        else:
+
+            state = "🔴"
+
+
+        st.write(
+            (
+                f"{state} Réserve conseillée : "
+                f"**{CREDIT_RESERVE} crédits**"
+            )
+        )
+
+
+        st.write(
+            (
+                "Budget exploitable "
+                "au-dessus de la réserve : "
+                f"**{stats['usable_after_reserve']}**"
+            )
+        )
+
+
+# ============================================================
+# RESULTATS MANUELS
+# ============================================================
+
+def settle_signal_manual(
+    signal_id,
+    home_score,
+    away_score
+):
+
+    signals = (
+        load_signals_records()
+    )
+
+
+    signal = next(
+
+        (
+            row
+
+            for row in signals
+
+            if (
+                str(
+                    row.get(
+                        "signal_id",
+                        ""
+                    )
+                )
+
+                == str(
+                    signal_id
+                )
+            )
+        ),
+
+        None,
+    )
+
+
+    if signal is None:
+
+        raise ValueError(
+            "Signal introuvable."
+        )
+
+
+    home = signal[
+        "home"
+    ]
+
+    away = signal[
+        "away"
+    ]
+
+
+    if (
+        home_score
+        > away_score
+    ):
+
+        winner = home
+
+    elif (
+        away_score
+        > home_score
+    ):
+
+        winner = away
+
+    else:
+
+        winner = "Draw"
+
+
+    won = (
+
+        str(
+            signal[
+                "outcome"
+            ]
+        )
+
+        == str(
+            winner
+        )
+    )
+
+
+    bet_odd = float(
+        signal.get(
+            "bet_odd"
+        )
+        or 0
+    )
+
+
+    profit = round(
+
+        (
+            bet_odd - 1
+            if won
+            else -1
+        ),
+
+        4,
+    )
+
+
+    update_sheet_row_by_key(
+        sheet_signals,
+        "signal_id",
+        signal_id,
+        {
+
+            "status":
+                "SETTLED",
+
+            "home_score":
+                int(
+                    home_score
+                ),
+
+            "away_score":
+                int(
+                    away_score
+                ),
+
+            "result":
+                (
+                    "WIN"
+                    if won
+                    else "LOSS"
+                ),
+
+            "profit":
+                profit,
+        },
+    )
+
+
+# ============================================================
+# DASHBOARD
+# ============================================================
+
+def dashboard():
+
+    signals = pd.DataFrame(
+        sheet_signals.get_all_records()
+    )
+
+
+    if signals.empty:
+
+        st.info(
+            "Aucun signal officiel enregistré."
+        )
+
+        return
+
+
+    for col in [
+        "profit",
+        "bet_odd",
+        "edge_historical_pct",
+        "clv_pct",
+    ]:
+
+        if col in signals.columns:
+
+            signals[
+                col
+            ] = pd.to_numeric(
+                signals[
+                    col
+                ],
+                errors="coerce",
+            )
+
+
+    settled = signals[
+
+        signals[
+            "status"
+        ]
+        .astype(str)
+        .str.upper()
+
+        == "SETTLED"
+
+    ].copy()
+
+
+    open_df = signals[
+
+        signals[
+            "status"
+        ]
+        .astype(str)
+        .str.upper()
+
+        == "OPEN"
+
+    ].copy()
+
+
+    total_profit = (
+
+        settled[
+            "profit"
+        ].sum()
+
+        if not settled.empty
+
+        else 0
+    )
+
+
+    roi = (
+
+        total_profit
+        / len(settled)
+        * 100
+
+        if len(settled)
+
+        else 0
+    )
+
+
+    wins = (
+
+        (
+            settled[
+                "result"
+            ]
+            == "WIN"
+        ).sum()
+
+        if len(settled)
+
+        else 0
+    )
+
+
+    winrate = (
+
+        wins
+        / len(settled)
+        * 100
+
+        if len(settled)
+
+        else 0
+    )
+
+
+    avg_edge = (
+
+        signals[
+            "edge_historical_pct"
+        ].mean()
+
+        if (
+            "edge_historical_pct"
+            in signals.columns
+        )
+
+        else float(
+            "nan"
+        )
+    )
+
+
+    avg_clv = (
+
+        signals[
+            "clv_pct"
+        ]
+        .dropna()
+        .mean()
+
+        if (
+            "clv_pct"
+            in signals.columns
+        )
+
+        else float(
+            "nan"
+        )
+    )
+
+
+    c1, c2, c3, c4 = (
+        st.columns(4)
+    )
+
+
+    c1.metric(
+        "Signals officiels",
+        len(signals),
+    )
+
+
+    c2.metric(
+        "Réglés",
+        len(settled),
+    )
+
+
+    c3.metric(
+        "Profit",
+        f"{total_profit:+.2f} u",
+    )
+
+
+    c4.metric(
+        "ROI",
+        f"{roi:+.2f}%",
+    )
+
+
+    c1, c2, c3, c4 = (
+        st.columns(4)
+    )
+
+
+    c1.metric(
+        "Ouverts",
+        len(open_df),
+    )
+
+
+    c2.metric(
+        "Winrate",
+        f"{winrate:.1f}%",
+    )
+
+
+    c3.metric(
+        "Edge moyen",
+        (
+            f"{avg_edge:.2f}%"
+
+            if pd.notna(
+                avg_edge
+            )
+
+            else "—"
+        ),
+    )
+
+
+    c4.metric(
+        "CLV moyenne",
+        (
+            f"{avg_clv:+.2f}%"
+
+            if pd.notna(
+                avg_clv
+            )
+
+            else "—"
+        ),
+    )
+
+
+    st.caption(
+        (
+            "Le ROI observé sur un petit "
+            "échantillon peut varier fortement "
+            "et ne garantit pas un rendement futur."
+        )
+    )
+
+
+    if len(settled):
+
+        st.subheader(
+            "Performance par ligue"
+        )
+
+
+        by_league = (
+
+            settled
+            .groupby(
+                "league"
+            )
+            .agg(
+
+                paris=(
+                    "signal_id",
+                    "count",
+                ),
+
+                profit=(
+                    "profit",
+                    "sum",
+                ),
+            )
+            .reset_index()
+        )
+
+
+        by_league[
+            "roi_pct"
+        ] = (
+
+            by_league[
+                "profit"
+            ]
+
+            / by_league[
+                "paris"
+            ]
+
+            * 100
+        )
+
+
+        st.dataframe(
+            by_league.sort_values(
+                "paris",
+                ascending=False,
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
+    st.subheader(
+        "Derniers signals"
+    )
+
+
+    st.dataframe(
+        signals.tail(
+            30
+        ).iloc[::-1],
+        use_container_width=True,
+        hide_index=True,
+    )
 
 
 # ============================================================
@@ -1074,30 +2899,33 @@ def creer_excel():
         sheet_signals.get_all_records()
     )
 
+
     buffer = BytesIO()
+
 
     with pd.ExcelWriter(
         buffer,
-        engine="openpyxl"
+        engine="openpyxl",
     ) as writer:
 
         scans.to_excel(
             writer,
             sheet_name="Scans",
-            index=False
+            index=False,
         )
 
         matchs.to_excel(
             writer,
             sheet_name="Matchs",
-            index=False
+            index=False,
         )
 
         signals.to_excel(
             writer,
             sheet_name="Signals",
-            index=False
+            index=False,
         )
+
 
     buffer.seek(0)
 
@@ -1105,31 +2933,49 @@ def creer_excel():
 
 
 # ============================================================
-# UI
+# INTERFACE
 # ============================================================
 
 st.title(
-    "📊 Value Scanner V7.1"
+    "📊 Value Scanner V8 Final"
 )
+
 
 st.caption(
-    "Planning Closing + "
-    "scans persistants + "
-    "formule historique"
+    (
+        "Planning + Closing Scanner économique + "
+        "formule historique + quality check + ROI"
+    )
 )
+
 
 st.info(
-    "🎯 Validation officielle : "
-    "CLOSING (5–60 min avant match) "
-    "+ edge historique ≥5 %."
+    (
+        "🎯 Signal officiel = CLOSING 5–60 min "
+        "+ edge historique ≥5 % "
+        "+ contrôle qualité PASS."
+    )
 )
 
 
-tab_planning, tab_scan, tab_history = st.tabs([
-    "📅 Planning Closing",
-    "🎯 Scanner",
-    "📊 Historique"
-])
+afficher_budget()
+
+
+(
+    tab_planning,
+    tab_scan,
+    tab_dashboard,
+    tab_results,
+    tab_history
+) = st.tabs(
+    [
+        "📅 Planning",
+        "🎯 Closing Scanner",
+        "📈 Dashboard",
+        "⚽ Résultats",
+        "📚 Historique",
+    ]
+)
 
 
 # ============================================================
@@ -1142,233 +2988,565 @@ with tab_planning:
         "📅 Matchs du jour"
     )
 
-    planning_leagues = st.multiselect(
-        "Ligues à surveiller",
-        list(SPORTS.keys()),
-        default=list(SPORTS.keys()),
-        key="planning_leagues"
+
+    selected_planning_leagues = (
+        st.multiselect(
+
+            "Ligues à surveiller",
+
+            list(
+                SPORTS.keys()
+            ),
+
+            default=list(
+                SPORTS.keys()
+            ),
+
+            key="planning_leagues",
+        )
     )
+
 
     if st.button(
-        "📅 Actualiser le planning",
-        use_container_width=True
+        "🔄 Actualiser le planning",
+        use_container_width=True,
     ):
-        recuperer_events_ligue.clear()
 
-    planning_rows, errors = recuperer_planning(
-        planning_leagues
+        fetch_events_for_league.clear()
+
+
+    (
+        planning_rows,
+        planning_errors
+    ) = build_planning(
+        selected_planning_leagues
     )
 
-    now_paris = datetime.now(
-        PARIS_TZ
+
+    today = (
+        now_paris().date()
     )
 
-    today_paris = now_paris.date()
 
     today_rows = [
-        r
-        for r in planning_rows
+
+        row
+
+        for row in planning_rows
+
         if (
-            r["date_paris"] == today_paris
-            and r["minutes_before_match"] > 0
+            row[
+                "match_dt_paris"
+            ].date()
+
+            == today
         )
     ]
 
-    today_rows = sorted(
-        today_rows,
-        key=lambda x: x["match_time_paris"]
-    )
 
     st.metric(
-        "Matchs suivis aujourd'hui",
-        len(today_rows)
+        "Matchs encore à venir aujourd'hui",
+        len(
+            today_rows
+        ),
     )
 
-    if not today_rows:
 
-        st.info(
-            "Aucun match à venir aujourd'hui."
+    closing_now = [
+
+        row
+
+        for row in today_rows
+
+        if (
+            row[
+                "timing"
+            ]
+            == "CLOSING"
         )
+    ]
+
+
+    leagues_now = sorted(
+
+        {
+            row[
+                "league"
+            ]
+
+            for row in closing_now
+        }
+    )
+
+
+    if closing_now:
+
+        st.success(
+            (
+                f"🎯 {len(closing_now)} match(s) "
+                "sont actuellement en CLOSING."
+            )
+        )
+
+
+        st.write(
+            (
+                "**Ligues à scanner maintenant :** "
+                + ", ".join(
+                    leagues_now
+                )
+            )
+        )
+
+
+        st.write(
+            (
+                "**Coût prévu du scan : "
+                f"{len(leagues_now)} crédit(s)**"
+            )
+        )
+
 
     else:
 
-        closing_now = [
-            r
-            for r in today_rows
-            if r["timing"] == "CLOSING"
-        ]
-
-        leagues_closing_now = sorted(
-            set(
-                r["league"]
-                for r in closing_now
+        st.info(
+            (
+                "Aucun match n'est actuellement "
+                "dans la fenêtre CLOSING."
             )
         )
 
-        if closing_now:
 
-            st.success(
-                f"🎯 {len(closing_now)} match(s) "
-                f"sont actuellement en CLOSING."
-            )
+    future = [
 
-            st.write(
-                "**Ligues à scanner maintenant :** "
-                + ", ".join(
-                    leagues_closing_now
-                )
-            )
+        row
 
-            st.write(
-                f"**Coût estimé : "
-                f"{len(leagues_closing_now)} crédit(s)**"
-            )
+        for row in today_rows
 
-            if st.button(
-                "🚨 Scanner les closings maintenant",
-                type="primary",
-                use_container_width=True
-            ):
+        if (
+            row[
+                "closing_start"
+            ]
+            > now_paris()
+        )
+    ]
 
-                executer_scan(
-                    leagues_closing_now
-                )
 
-        future_windows = [
-            r
-            for r in today_rows
-            if r["closing_start_dt"] > now_paris
-        ]
+    if future:
 
-        if future_windows:
+        next_start = min(
 
-            next_start = min(
-                r["closing_start_dt"]
-                for r in future_windows
-            )
-
-            next_group = [
-                r
-                for r in future_windows
-                if abs(
-                    (
-                        r["closing_start_dt"]
-                        - next_start
-                    ).total_seconds()
-                ) <= 600
+            row[
+                "closing_start"
             ]
 
-            next_leagues = sorted(
-                set(
-                    r["league"]
-                    for r in next_group
-                )
+            for row in future
+        )
+
+
+        next_group = [
+
+            row
+
+            for row in future
+
+            if abs(
+                (
+                    row[
+                        "closing_start"
+                    ]
+                    - next_start
+                ).total_seconds()
             )
+            <= 600
+        ]
 
-            minutes_until = (
-                next_start - now_paris
-            ).total_seconds() / 60
 
-            st.subheader(
-                "⏰ Prochain scan recommandé"
+        next_leagues = sorted(
+
+            {
+                row[
+                    "league"
+                ]
+
+                for row in next_group
+            }
+        )
+
+
+        minutes_until = (
+
+            next_start
+            - now_paris()
+
+        ).total_seconds() / 60
+
+
+        st.subheader(
+            "⏰ Prochain scan recommandé"
+        )
+
+
+        st.write(
+            (
+                f"À partir de **"
+                f"{next_start.strftime('%H:%M')}**, "
+                f"dans environ **"
+                f"{max(0, round(minutes_until))} min**."
             )
+        )
 
-            st.write(
-                f"**À partir de : "
-                f"{next_start.strftime('%H:%M')}**"
-            )
 
-            st.write(
-                f"Dans environ "
-                f"**{max(0, round(minutes_until))} min**"
-            )
-
-            st.write(
+        st.write(
+            (
                 "**Ligues :** "
                 + ", ".join(
                     next_leagues
                 )
             )
+        )
 
-            st.write(
-                f"**Coût estimé : "
+
+        st.write(
+            (
+                "**Coût prévu : "
                 f"{len(next_leagues)} crédit(s)**"
             )
-
-        st.subheader(
-            "🗓️ Planning complet"
         )
+
+
+    if today_rows:
 
         planning_display = []
 
-        for r in today_rows:
 
-            if r["timing"] == "CLOSING":
-                action = "🎯 SCANNER MAINTENANT"
-            elif r["timing"] == "TOO_LATE":
-                action = "⚠️ Trop proche"
-            else:
-                action = "⏳ Attendre"
+        for row in today_rows:
 
             planning_display.append({
-                "Heure": r["kickoff"],
-                "Ligue": r["league"],
-                "Domicile": r["home"],
-                "Extérieur": r["away"],
-                "Fenêtre Closing": r["closing_window"],
-                "Minutes restantes": round(
-                    r["minutes_before_match"]
-                ),
-                "Statut": r["timing"],
-                "Action": action
+
+                "Heure":
+                    row[
+                        "kickoff"
+                    ],
+
+                "Ligue":
+                    row[
+                        "league"
+                    ],
+
+                "Domicile":
+                    row[
+                        "home"
+                    ],
+
+                "Extérieur":
+                    row[
+                        "away"
+                    ],
+
+                "Fenêtre Closing":
+                    row[
+                        "closing_window"
+                    ],
+
+                "Minutes restantes":
+                    round(
+                        row[
+                            "minutes_before_match"
+                        ]
+                    ),
+
+                "Statut":
+                    row[
+                        "timing"
+                    ],
             })
 
+
         st.dataframe(
-            pd.DataFrame(planning_display),
+            pd.DataFrame(
+                planning_display
+            ),
             use_container_width=True,
-            hide_index=True
+            hide_index=True,
         )
 
-    if errors:
+
+    if planning_errors:
 
         with st.expander(
             "⚠️ Erreurs planning"
         ):
 
-            for error in errors:
-                st.write(error)
+            for error in planning_errors:
+
+                st.write(
+                    error
+                )
 
 
 # ============================================================
-# SCAN MANUEL
+# CLOSING SCANNER
 # ============================================================
 
 with tab_scan:
 
     st.header(
-        "🎯 Scanner les cotes"
+        "🎯 Closing Scanner"
     )
 
-    selected_leagues = st.multiselect(
-        "Ligues à scanner",
-        list(SPORTS.keys()),
-        default=["Japon J-League"],
-        key="manual_scan"
+
+    planning_rows, _ = (
+        build_planning(
+            list(
+                SPORTS.keys()
+            )
+        )
     )
 
-    st.caption(
-        f"Coût estimé : "
-        f"{len(selected_leagues)} crédit(s)"
+
+    today = (
+        now_paris().date()
     )
+
+
+    suggested_leagues = sorted(
+
+        {
+            row[
+                "league"
+            ]
+
+            for row in planning_rows
+
+            if (
+                row[
+                    "match_dt_paris"
+                ].date()
+
+                == today
+
+                and
+
+                row[
+                    "timing"
+                ]
+                == "CLOSING"
+            )
+        }
+    )
+
+
+    selected_scan_leagues = (
+        st.multiselect(
+
+            "Ligues à scanner",
+
+            list(
+                SPORTS.keys()
+            ),
+
+            default=suggested_leagues,
+
+            key="scan_leagues",
+        )
+    )
+
+
+    scan_cost = len(
+        selected_scan_leagues
+    )
+
+
+    if scan_cost == 0:
+
+        st.info(
+            (
+                "Aucune ligue sélectionnée. "
+                "Le scan coûtera 0 crédit."
+            )
+        )
+
+    else:
+
+        st.warning(
+            (
+                f"Coût prévu du prochain scan : "
+                f"**{scan_cost} crédit(s)**."
+            )
+        )
+
 
     if st.button(
-        "🔍 Scanner les ligues sélectionnées",
-        use_container_width=True
+        "🔍 Scanner les cotes",
+        type="primary",
+        use_container_width=True,
     ):
 
         executer_scan(
-            selected_leagues
+            selected_scan_leagues
         )
+
+
+# ============================================================
+# DASHBOARD
+# ============================================================
+
+with tab_dashboard:
+
+    st.header(
+        "📈 Validation de la stratégie"
+    )
+
+    dashboard()
+
+
+# ============================================================
+# RESULTATS
+# ============================================================
+
+with tab_results:
+
+    st.header(
+        "⚽ Résultats manuels"
+    )
+
+
+    signals = (
+        load_signals_records()
+    )
+
+
+    open_signals = [
+
+        row
+
+        for row in signals
+
+        if (
+            str(
+                row.get(
+                    "status",
+                    ""
+                )
+            ).upper()
+
+            == "OPEN"
+        )
+    ]
+
+
+    if not open_signals:
+
+        st.info(
+            "Aucun signal ouvert."
+        )
+
+
+    else:
+
+        labels = {}
+
+
+        for row in open_signals:
+
+            label = (
+                f"{row['signal_id']} — "
+                f"{row['home']} vs "
+                f"{row['away']} — "
+                f"{row['outcome']} "
+                f"@{row['bet_odd']}"
+            )
+
+
+            labels[
+                label
+            ] = row
+
+
+        selected_label = (
+            st.selectbox(
+                "Signal à régler",
+                list(
+                    labels.keys()
+                ),
+            )
+        )
+
+
+        selected_signal = (
+            labels[
+                selected_label
+            ]
+        )
+
+
+        st.write(
+            (
+                f"**"
+                f"{selected_signal['home']} "
+                f"vs "
+                f"{selected_signal['away']}"
+                f"**"
+            )
+        )
+
+
+        c1, c2 = (
+            st.columns(2)
+        )
+
+
+        home_score = (
+            c1.number_input(
+
+                f"Buts "
+                f"{selected_signal['home']}",
+
+                min_value=0,
+
+                step=1,
+            )
+        )
+
+
+        away_score = (
+            c2.number_input(
+
+                f"Buts "
+                f"{selected_signal['away']}",
+
+                min_value=0,
+
+                step=1,
+            )
+        )
+
+
+        if st.button(
+            "✅ Enregistrer le résultat",
+            use_container_width=True,
+        ):
+
+            settle_signal_manual(
+                selected_signal[
+                    "signal_id"
+                ],
+                int(
+                    home_score
+                ),
+                int(
+                    away_score
+                ),
+            )
+
+
+            st.success(
+                "Résultat enregistré."
+            )
+
+
+            st.rerun()
 
 
 # ============================================================
@@ -1378,95 +3556,115 @@ with tab_scan:
 with tab_history:
 
     st.header(
-        "📊 Historique"
+        "📚 Historique"
     )
 
-    if st.button(
-        "Actualiser l'historique"
-    ):
 
-        scans_df = pd.DataFrame(
-            sheet_scans.get_all_records()
+    scans_df = pd.DataFrame(
+        sheet_scans.get_all_records()
+    )
+
+
+    matchs_df = pd.DataFrame(
+        sheet_matchs.get_all_records()
+    )
+
+
+    signals_df = pd.DataFrame(
+        sheet_signals.get_all_records()
+    )
+
+
+    st.subheader(
+        "Derniers scans"
+    )
+
+
+    if scans_df.empty:
+
+        st.info(
+            "Aucun scan enregistré."
         )
 
-        matchs_df = pd.DataFrame(
-            sheet_matchs.get_all_records()
-        )
-
-        signals_df = pd.DataFrame(
-            sheet_signals.get_all_records()
-        )
-
-        st.subheader(
-            "Derniers scans"
-        )
-
-        if not scans_df.empty:
-
-            st.dataframe(
-                scans_df.tail(20).iloc[::-1],
-                use_container_width=True,
-                hide_index=True
-            )
-
-        st.subheader(
-            "Dernier scan enregistré"
-        )
-
-        if not scans_df.empty:
-
-            last_scan_id = (
-                scans_df.iloc[-1]["scan_id"]
-            )
-
-            st.write(
-                f"**{last_scan_id}**"
-            )
-
-            last_matchs = matchs_df[
-                matchs_df["scan_id"]
-                == last_scan_id
-            ]
-
-            if not last_matchs.empty:
-
-                st.dataframe(
-                    last_matchs,
-                    use_container_width=True,
-                    hide_index=True
-                )
-
-        st.subheader(
-            "Signals"
-        )
+    else:
 
         st.dataframe(
-            signals_df,
+            scans_df.tail(
+                30
+            ).iloc[::-1],
             use_container_width=True,
-            hide_index=True
+            hide_index=True,
         )
+
+
+    st.subheader(
+        "Derniers matchs CLOSING"
+    )
+
+
+    if matchs_df.empty:
+
+        st.info(
+            "Aucun match CLOSING enregistré."
+        )
+
+    else:
+
+        st.dataframe(
+            matchs_df.tail(
+                60
+            ).iloc[::-1],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+
+    st.subheader(
+        "Signals"
+    )
+
+
+    if signals_df.empty:
+
+        st.info(
+            "Aucun signal."
+        )
+
+    else:
+
+        st.dataframe(
+            signals_df.tail(
+                50
+            ).iloc[::-1],
+            use_container_width=True,
+            hide_index=True,
+        )
+
 
     st.subheader(
         "📥 Export Excel"
     )
 
+
     try:
 
-        excel_file = creer_excel()
-
         st.download_button(
-            label="Télécharger l'historique Excel",
-            data=excel_file,
-            file_name="value_scanner_historique.xlsx",
+            "Télécharger l'historique Excel",
+            data=creer_excel(),
+            file_name=(
+                "value_scanner_historique.xlsx"
+            ),
             mime=(
-                "application/"
-                "vnd.openxmlformats-officedocument."
+                "application/vnd.openxmlformats-officedocument."
                 "spreadsheetml.sheet"
-            )
+            ),
         )
 
-    except:
+    except Exception as exc:
 
         st.warning(
-            "Export Excel temporairement indisponible."
+            (
+                "Export temporairement "
+                f"indisponible : {exc}"
+            )
         )
