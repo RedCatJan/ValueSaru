@@ -18,6 +18,7 @@ st.set_page_config(
     layout="wide"
 )
 
+# Seuil officiel figé
 EDGE_MIN = 0.05
 
 SPORTS = {
@@ -40,6 +41,7 @@ GOOGLE_SHEET_ID = st.secrets["GOOGLE_SHEET_ID"]
 
 @st.cache_resource
 def connexion_google():
+
     scopes = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive"
@@ -63,7 +65,54 @@ sheet_signals = spreadsheet.worksheet("Signals")
 
 
 # ============================================================
-# CALCUL FAIR ODDS
+# HEADERS GOOGLE SHEETS
+# ============================================================
+
+MATCHS_HEADERS = [
+    "scan_id",
+    "timestamp",
+    "league",
+    "home",
+    "away",
+    "match_time",
+    "minutes_before_match",
+    "timing",
+    "outcome",
+
+    # Anciennes colonnes conservées
+    "fair_odd",
+    "best_odd",
+    "bookmaker",
+    "edge_pct",
+    "signal",
+    "bookmakers_used",
+
+    # Nouvelles colonnes historiques
+    "fair_odd_historical",
+    "edge_historical_pct",
+    "signal_historical"
+]
+
+
+def verifier_headers_matchs():
+
+    first_row = sheet_matchs.row_values(1)
+
+    # Si certaines nouvelles colonnes manquent,
+    # on met à jour uniquement la ligne d'en-tête.
+    if first_row != MATCHS_HEADERS:
+        sheet_matchs.update(
+            "A1:R1",
+            [MATCHS_HEADERS]
+        )
+
+
+verifier_headers_matchs()
+
+
+# ============================================================
+# MÉTHODE V5
+# Démarge bookmaker par bookmaker
 # ============================================================
 
 def demarger(c1, cx, c2):
@@ -102,6 +151,7 @@ def analyser_match(match, league_name, scan_id):
         match_time - now
     ).total_seconds() / 60
 
+    # Match déjà commencé
     if minutes_before_match <= 0:
         return []
 
@@ -110,19 +160,34 @@ def analyser_match(match, league_name, scan_id):
     else:
         timing = "EARLY"
 
+    # ========================================================
+    # Données pour méthode V5
+    # ========================================================
+
     bookmaker_probs = []
+
+    # ========================================================
+    # Données pour méthode historique
+    # Moyenne brute des cotes
+    # ========================================================
+
+    raw_odds_home = []
+    raw_odds_draw = []
+    raw_odds_away = []
+
+    # ========================================================
+    # Meilleures cotes
+    # ========================================================
 
     best = {
         home: {
             "odd": 0,
             "book": None
         },
-
         "Draw": {
             "odd": 0,
             "book": None
         },
-
         away: {
             "odd": 0,
             "book": None
@@ -131,6 +196,10 @@ def analyser_match(match, league_name, scan_id):
 
     bookmakers_used = 0
 
+    # ========================================================
+    # BOUCLE BOOKMAKERS
+    # ========================================================
+
     for bookmaker in match.get("bookmakers", []):
 
         book_name = bookmaker.get(
@@ -138,21 +207,14 @@ def analyser_match(match, league_name, scan_id):
             "Inconnu"
         )
 
-        for market in bookmaker.get(
-            "markets",
-            []
-        ):
+        for market in bookmaker.get("markets", []):
 
             if market.get("key") != "h2h":
                 continue
 
             odds = {}
 
-            for outcome in market.get(
-                "outcomes",
-                []
-            ):
-
+            for outcome in market.get("outcomes", []):
                 odds[outcome["name"]] = outcome["price"]
 
             if home not in odds:
@@ -171,9 +233,26 @@ def analyser_match(match, league_name, scan_id):
             if draw_key is None:
                 continue
 
-            c1 = odds[home]
-            cx = odds[draw_key]
-            c2 = odds[away]
+            c1 = float(odds[home])
+            cx = float(odds[draw_key])
+            c2 = float(odds[away])
+
+            if c1 <= 1 or cx <= 1 or c2 <= 1:
+                continue
+
+            # ------------------------------------------------
+            # MÉTHODE HISTORIQUE :
+            # stocker les cotes brutes
+            # ------------------------------------------------
+
+            raw_odds_home.append(c1)
+            raw_odds_draw.append(cx)
+            raw_odds_away.append(c2)
+
+            # ------------------------------------------------
+            # MÉTHODE V5 :
+            # démarge chaque bookmaker individuellement
+            # ------------------------------------------------
 
             p1, px, p2 = demarger(
                 c1,
@@ -187,50 +266,123 @@ def analyser_match(match, league_name, scan_id):
 
             bookmakers_used += 1
 
-            if c1 > best[home]["odd"]:
+            # ------------------------------------------------
+            # Meilleures cotes
+            # ------------------------------------------------
 
+            if c1 > best[home]["odd"]:
                 best[home] = {
                     "odd": c1,
                     "book": book_name
                 }
 
             if cx > best["Draw"]["odd"]:
-
                 best["Draw"] = {
                     "odd": cx,
                     "book": book_name
                 }
 
             if c2 > best[away]["odd"]:
-
                 best[away] = {
                     "odd": c2,
                     "book": book_name
                 }
 
+    # Pas assez de données
     if not bookmaker_probs:
         return []
 
-    consensus_home = (
+    if (
+        not raw_odds_home
+        or not raw_odds_draw
+        or not raw_odds_away
+    ):
+        return []
+
+    # ========================================================
+    # MÉTHODE V5
+    # Moyenne des probabilités démargées
+    # ========================================================
+
+    consensus_home_v5 = (
         sum(x[0] for x in bookmaker_probs)
         / len(bookmaker_probs)
     )
 
-    consensus_draw = (
+    consensus_draw_v5 = (
         sum(x[1] for x in bookmaker_probs)
         / len(bookmaker_probs)
     )
 
-    consensus_away = (
+    consensus_away_v5 = (
         sum(x[2] for x in bookmaker_probs)
         / len(bookmaker_probs)
     )
 
-    fair = {
-        home: 1 / consensus_home,
-        "Draw": 1 / consensus_draw,
-        away: 1 / consensus_away
+    fair_v5 = {
+        home: 1 / consensus_home_v5,
+        "Draw": 1 / consensus_draw_v5,
+        away: 1 / consensus_away_v5
     }
+
+    # ========================================================
+    # MÉTHODE HISTORIQUE
+    #
+    # 1. moyenne brute des cotes
+    # 2. probabilités implicites
+    # 3. retrait de marge
+    # 4. fair odds
+    #
+    # C'est cette méthode qui doit être comparée
+    # au backtest Japon.
+    # ========================================================
+
+    avg_home = (
+        sum(raw_odds_home)
+        / len(raw_odds_home)
+    )
+
+    avg_draw = (
+        sum(raw_odds_draw)
+        / len(raw_odds_draw)
+    )
+
+    avg_away = (
+        sum(raw_odds_away)
+        / len(raw_odds_away)
+    )
+
+    p_home_raw = 1 / avg_home
+    p_draw_raw = 1 / avg_draw
+    p_away_raw = 1 / avg_away
+
+    total_raw = (
+        p_home_raw
+        + p_draw_raw
+        + p_away_raw
+    )
+
+    hist_prob_home = (
+        p_home_raw / total_raw
+    )
+
+    hist_prob_draw = (
+        p_draw_raw / total_raw
+    )
+
+    hist_prob_away = (
+        p_away_raw / total_raw
+    )
+
+    fair_historical = {
+        home: 1 / hist_prob_home,
+        "Draw": 1 / hist_prob_draw,
+        away: 1 / hist_prob_away
+    }
+
+    # ========================================================
+    # CONSTRUCTION DES 3 ISSUES
+    # ========================================================
 
     rows = []
 
@@ -249,13 +401,39 @@ def analyser_match(match, league_name, scan_id):
         if max_odd == 0:
             continue
 
-        fair_odd = fair[outcome]
+        # ----------------------------------------------------
+        # Fair odds
+        # ----------------------------------------------------
 
-        edge = (
-            max_odd / fair_odd
+        fair_odd_v5 = fair_v5[outcome]
+
+        fair_odd_hist = (
+            fair_historical[outcome]
+        )
+
+        # ----------------------------------------------------
+        # Edge V5
+        # ----------------------------------------------------
+
+        edge_v5 = (
+            max_odd / fair_odd_v5
         ) - 1
 
-        signal = edge >= EDGE_MIN
+        # ----------------------------------------------------
+        # Edge historique
+        # ----------------------------------------------------
+
+        edge_historical = (
+            max_odd / fair_odd_hist
+        ) - 1
+
+        signal_v5 = (
+            edge_v5 >= EDGE_MIN
+        )
+
+        signal_historical = (
+            edge_historical >= EDGE_MIN
+        )
 
         rows.append({
 
@@ -281,9 +459,14 @@ def analyser_match(match, league_name, scan_id):
 
             "outcome": outcome,
 
+            # -----------------------------------------------
+            # Anciennes colonnes :
+            # représentent désormais la méthode V5
+            # -----------------------------------------------
+
             "fair_odd":
                 round(
-                    fair_odd,
+                    fair_odd_v5,
                     4
                 ),
 
@@ -298,17 +481,38 @@ def analyser_match(match, league_name, scan_id):
 
             "edge_pct":
                 round(
-                    edge * 100,
+                    edge_v5 * 100,
                     2
                 ),
 
             "signal":
                 "YES"
-                if signal
+                if signal_v5
                 else "NO",
 
             "bookmakers_used":
-                bookmakers_used
+                bookmakers_used,
+
+            # -----------------------------------------------
+            # Méthode historique
+            # -----------------------------------------------
+
+            "fair_odd_historical":
+                round(
+                    fair_odd_hist,
+                    4
+                ),
+
+            "edge_historical_pct":
+                round(
+                    edge_historical * 100,
+                    2
+                ),
+
+            "signal_historical":
+                "YES"
+                if signal_historical
+                else "NO"
         })
 
     return rows
@@ -330,13 +534,9 @@ def scanner_ligue(
     )
 
     params = {
-
         "apiKey": API_KEY,
-
         "regions": "fr",
-
         "markets": "h2h",
-
         "oddsFormat": "decimal"
     }
 
@@ -384,23 +584,17 @@ def scanner_ligue(
         )
 
     return {
-
         "rows": rows,
-
         "matches": len(matches),
-
         "remaining": remaining,
-
         "used": used,
-
         "last": last,
-
         "error": None
     }
 
 
 # ============================================================
-# GOOGLE SHEETS : ENREGISTREMENT
+# ENREGISTRER TOUS LES MATCHS
 # ============================================================
 
 def enregistrer_matchs(rows):
@@ -423,12 +617,19 @@ def enregistrer_matchs(rows):
             r["minutes_before_match"],
             r["timing"],
             r["outcome"],
+
+            # V5
             r["fair_odd"],
             r["best_odd"],
             r["bookmaker"],
             r["edge_pct"],
             r["signal"],
-            r["bookmakers_used"]
+            r["bookmakers_used"],
+
+            # Historique
+            r["fair_odd_historical"],
+            r["edge_historical_pct"],
+            r["signal_historical"]
         ])
 
     sheet_matchs.append_rows(
@@ -436,6 +637,10 @@ def enregistrer_matchs(rows):
         value_input_option="USER_ENTERED"
     )
 
+
+# ============================================================
+# ANTI-DOUBLONS SIGNALS
+# ============================================================
 
 def recuperer_signal_keys():
 
@@ -459,12 +664,20 @@ def recuperer_signal_keys():
     return keys
 
 
+# ============================================================
+# ENREGISTRER SIGNALS HISTORIQUES
+# ============================================================
+
 def enregistrer_signals(rows):
+
+    # IMPORTANT :
+    # seuls les signaux de la formule historique
+    # sont enregistrés comme signaux officiels.
 
     signals = [
         x
         for x in rows
-        if x["signal"] == "YES"
+        if x["signal_historical"] == "YES"
     ]
 
     if not signals:
@@ -501,15 +714,17 @@ def enregistrer_signals(rows):
             r["minutes_before_match"],
             r["timing"],
             r["outcome"],
-            r["fair_odd"],
+
+            # Ici on stocke la méthode historique
+            r["fair_odd_historical"],
             r["best_odd"],
             r["bookmaker"],
-            r["edge_pct"],
+            r["edge_historical_pct"],
 
-            "",     # result
-            "",     # closing_odd
-            "",     # clv_pct
-            ""      # profit
+            "",  # result
+            "",  # closing_odd
+            "",  # clv_pct
+            ""   # profit
         ])
 
     if new_rows:
@@ -574,38 +789,26 @@ def creer_excel():
 # INTERFACE
 # ============================================================
 
-st.title("📊 Value Scanner V5")
+st.title("📊 Value Scanner V6")
 
 st.caption(
-    "Consensus bookmaker → "
-    "Fair odds → "
-    "Meilleure cote → "
-    "Edge ≥ 5%"
+    "Deux méthodes en parallèle : "
+    "V5 + formule historique du backtest"
+)
+
+st.info(
+    "🎯 Validation officielle : "
+    "CLOSING + edge historique ≥ 5 %"
 )
 
 
-# ------------------------------------------------------------
-# CRÉDITS ACTUELS
-# ------------------------------------------------------------
-
-st.subheader("💳 API")
-
-st.write(
-    "Le nombre exact de crédits sera mis à jour "
-    "après chaque scan."
-)
-
-
-# ------------------------------------------------------------
-# CHOIX LIGUES
-# ------------------------------------------------------------
+# ============================================================
+# CHOIX DES LIGUES
+# ============================================================
 
 selected_leagues = st.multiselect(
-
     "Ligues à scanner",
-
     list(SPORTS.keys()),
-
     default=list(SPORTS.keys())
 )
 
@@ -619,94 +822,85 @@ if st.button(
     use_container_width=True
 ):
 
-    scan_time = datetime.now(
-        timezone.utc
-    )
-
-    scan_id = (
-        "SCAN-"
-        + scan_time.strftime(
-            "%Y%m%d-%H%M%S"
+    if not selected_leagues:
+        st.warning(
+            "Sélectionne au moins une ligue."
         )
-    )
 
-    all_rows = []
+    else:
 
-    total_matches = 0
+        scan_time = datetime.now(
+            timezone.utc
+        )
 
-    credits_before = None
-    credits_after = None
-    credits_used_scan = 0
-
-    first_api_used = None
-    last_api_used = None
-
-    with st.spinner(
-        "Analyse en cours..."
-    ):
-
-        for league_name in selected_leagues:
-
-            result = scanner_ligue(
-
-                league_name,
-
-                SPORTS[league_name],
-
-                scan_id
+        scan_id = (
+            "SCAN-"
+            + scan_time.strftime(
+                "%Y%m%d-%H%M%S"
             )
+        )
 
-            if result["error"]:
+        all_rows = []
 
-                st.warning(
-                    f"{league_name} : "
-                    "erreur API"
+        total_matches = 0
+
+        credits_after = None
+
+        credits_used_scan = 0
+
+        # ====================================================
+        # SCAN
+        # ====================================================
+
+        with st.spinner(
+            "Analyse en cours..."
+        ):
+
+            for league_name in selected_leagues:
+
+                result = scanner_ligue(
+                    league_name,
+                    SPORTS[league_name],
+                    scan_id
                 )
 
-                continue
+                if result["error"]:
 
-            total_matches += (
-                result["matches"]
-            )
-
-            all_rows.extend(
-                result["rows"]
-            )
-
-            try:
-
-                api_used = int(
-                    result["used"]
-                )
-
-                if first_api_used is None:
-                    first_api_used = (
-                        api_used - 1
+                    st.warning(
+                        f"{league_name} : "
+                        "erreur API"
                     )
 
-                last_api_used = api_used
+                    continue
 
-            except:
-                pass
-
-            try:
-
-                credits_after = int(
-                    result["remaining"]
+                total_matches += (
+                    result["matches"]
                 )
 
-            except:
-                pass
+                all_rows.extend(
+                    result["rows"]
+                )
 
-    if (
-        first_api_used is not None
-        and last_api_used is not None
-    ):
+                # Coût exact de cet appel
+                try:
+                    credits_used_scan += int(
+                        result["last"]
+                    )
+                except:
+                    pass
 
-        credits_used_scan = (
-            last_api_used
-            - first_api_used
-        )
+                try:
+                    credits_after = int(
+                        result["remaining"]
+                    )
+                except:
+                    pass
+
+        # ====================================================
+        # CRÉDITS
+        # ====================================================
+
+        credits_before = None
 
         if credits_after is not None:
 
@@ -715,100 +909,139 @@ if st.button(
                 + credits_used_scan
             )
 
-    # --------------------------------------------------------
-    # SAUVEGARDE
-    # --------------------------------------------------------
+        # ====================================================
+        # SIGNALS
+        # ====================================================
 
-    enregistrer_matchs(
-        all_rows
-    )
+        signal_v5_count = sum(
+            1
+            for r in all_rows
+            if r["signal"] == "YES"
+        )
 
-    new_signals = enregistrer_signals(
-        all_rows
-    )
+        signal_hist_count = sum(
+            1
+            for r in all_rows
+            if r["signal_historical"] == "YES"
+        )
 
-    signal_count = sum(
+        closing_hist_count = sum(
+            1
+            for r in all_rows
+            if (
+                r["signal_historical"] == "YES"
+                and r["timing"] == "CLOSING"
+            )
+        )
 
-        1
-        for r in all_rows
-        if r["signal"] == "YES"
-    )
+        issues_count = len(all_rows)
 
-    issues_count = len(all_rows)
+        # ====================================================
+        # SAUVEGARDE GOOGLE
+        # ====================================================
 
-    sheet_scans.append_row([
+        enregistrer_matchs(
+            all_rows
+        )
 
-        scan_id,
+        new_signals = enregistrer_signals(
+            all_rows
+        )
 
-        scan_time.isoformat(
-            timespec="seconds"
-        ),
+        # ====================================================
+        # SCANS SHEET
+        # ====================================================
 
-        len(selected_leagues),
+        sheet_scans.append_row([
 
-        total_matches,
+            scan_id,
 
-        issues_count,
+            scan_time.isoformat(
+                timespec="seconds"
+            ),
 
-        signal_count,
+            len(selected_leagues),
 
-        credits_before
-        if credits_before is not None
-        else "",
+            total_matches,
 
-        credits_used_scan,
+            issues_count,
 
-        credits_after
-        if credits_after is not None
-        else ""
+            signal_hist_count,
 
-    ])
+            credits_before
+            if credits_before is not None
+            else "",
 
-    # --------------------------------------------------------
-    # RÉSUMÉ
-    # --------------------------------------------------------
+            credits_used_scan,
 
-    st.success(
-        "Scan terminé"
-    )
-
-    c1, c2, c3, c4 = st.columns(4)
-
-    c1.metric(
-        "Matchs",
-        total_matches
-    )
-
-    c2.metric(
-        "Issues analysées",
-        issues_count
-    )
-
-    c3.metric(
-        "Values ≥5%",
-        signal_count
-    )
-
-    c4.metric(
-        "Nouveaux signals",
-        new_signals
-    )
-
-    if credits_after is not None:
-
-        st.metric(
-            "Crédits API restants",
             credits_after
+            if credits_after is not None
+            else ""
+        ])
+
+        # ====================================================
+        # RÉSUMÉ
+        # ====================================================
+
+        st.success(
+            "Scan terminé"
         )
 
-    if credits_used_scan:
+        c1, c2, c3, c4 = st.columns(4)
 
-        st.write(
-            f"**Crédits utilisés pour ce scan : "
-            f"{credits_used_scan}**"
+        c1.metric(
+            "Matchs scannés",
+            total_matches
         )
 
-        if credits_after:
+        c2.metric(
+            "Issues analysées",
+            issues_count
+        )
+
+        c3.metric(
+            "Signals historiques ≥5%",
+            signal_hist_count
+        )
+
+        c4.metric(
+            "Closing signals",
+            closing_hist_count
+        )
+
+        # ====================================================
+        # CRÉDITS
+        # ====================================================
+
+        st.subheader(
+            "💳 Crédits API"
+        )
+
+        c1, c2, c3 = st.columns(3)
+
+        c1.metric(
+            "Avant scan",
+            credits_before
+            if credits_before is not None
+            else "?"
+        )
+
+        c2.metric(
+            "Utilisés",
+            credits_used_scan
+        )
+
+        c3.metric(
+            "Restants",
+            credits_after
+            if credits_after is not None
+            else "?"
+        )
+
+        if (
+            credits_after is not None
+            and credits_used_scan > 0
+        ):
 
             estimated_scans = (
                 credits_after
@@ -816,55 +1049,142 @@ if st.button(
             )
 
             st.write(
-                f"Environ **{estimated_scans} "
-                f"scans similaires** encore possibles."
+                f"Environ **{estimated_scans} scans "
+                f"similaires** encore possibles."
             )
 
-    # --------------------------------------------------------
-    # TABLEAU COMPLET
-    # --------------------------------------------------------
+        # ====================================================
+        # COMPARAISON DES MÉTHODES
+        # ====================================================
 
-    st.subheader(
-        "📋 Détail du scan"
-    )
-
-    df = pd.DataFrame(
-        all_rows
-    )
-
-    if not df.empty:
-
-        st.dataframe(
-            df,
-            use_container_width=True,
-            hide_index=True
+        st.subheader(
+            "🧪 Comparaison des méthodes"
         )
 
-    # --------------------------------------------------------
-    # VALUES
-    # --------------------------------------------------------
+        c1, c2 = st.columns(2)
 
-    signals_df = df[
-        df["signal"] == "YES"
-    ] if not df.empty else pd.DataFrame()
-
-    st.subheader(
-        "🚨 Values détectées"
-    )
-
-    if signals_df.empty:
-
-        st.info(
-            "Aucune value ≥5 %."
+        c1.metric(
+            "Signals V5",
+            signal_v5_count
         )
 
-    else:
-
-        st.dataframe(
-            signals_df,
-            use_container_width=True,
-            hide_index=True
+        c2.metric(
+            "Signals historiques",
+            signal_hist_count
         )
+
+        # ====================================================
+        # DÉTAIL COMPLET
+        # ====================================================
+
+        st.subheader(
+            "📋 Détail du scan"
+        )
+
+        df = pd.DataFrame(
+            all_rows
+        )
+
+        if not df.empty:
+
+            display_columns = [
+
+                "league",
+                "home",
+                "away",
+                "match_time",
+                "minutes_before_match",
+                "timing",
+                "outcome",
+
+                "fair_odd",
+                "fair_odd_historical",
+
+                "best_odd",
+                "bookmaker",
+
+                "edge_pct",
+                "edge_historical_pct",
+
+                "signal",
+                "signal_historical",
+
+                "bookmakers_used"
+            ]
+
+            st.dataframe(
+                df[display_columns],
+                use_container_width=True,
+                hide_index=True
+            )
+
+        # ====================================================
+        # VALUES HISTORIQUES
+        # ====================================================
+
+        st.subheader(
+            "🚨 Values historiques ≥5 %"
+        )
+
+        if df.empty:
+
+            st.info(
+                "Aucune donnée."
+            )
+
+        else:
+
+            signals_df = df[
+                df["signal_historical"] == "YES"
+            ].copy()
+
+            if signals_df.empty:
+
+                st.info(
+                    "Aucune value historique ≥5 %."
+                )
+
+            else:
+
+                st.dataframe(
+                    signals_df,
+                    use_container_width=True,
+                    hide_index=True
+                )
+
+        # ====================================================
+        # CLOSING OFFICIEL
+        # ====================================================
+
+        st.subheader(
+            "🎯 Closing signals officiels"
+        )
+
+        if not df.empty:
+
+            closing_df = df[
+                (
+                    df["signal_historical"] == "YES"
+                )
+                &
+                (
+                    df["timing"] == "CLOSING"
+                )
+            ].copy()
+
+            if closing_df.empty:
+
+                st.info(
+                    "Aucun signal CLOSING historique ≥5 %."
+                )
+
+            else:
+
+                st.dataframe(
+                    closing_df,
+                    use_container_width=True,
+                    hide_index=True
+                )
 
 
 # ============================================================
@@ -900,7 +1220,7 @@ if st.button(
     )
 
     st.subheader(
-        "Signals"
+        "Signals historiques"
     )
 
     st.dataframe(
@@ -911,7 +1231,7 @@ if st.button(
 
 
 # ============================================================
-# DOWNLOAD EXCEL
+# EXPORT EXCEL
 # ============================================================
 
 st.divider()
@@ -920,18 +1240,30 @@ st.header(
     "📥 Export"
 )
 
-excel_file = creer_excel()
+try:
 
-st.download_button(
+    excel_file = creer_excel()
 
-    label="Télécharger l'historique Excel",
+    st.download_button(
 
-    data=excel_file,
+        label=(
+            "Télécharger l'historique Excel"
+        ),
 
-    file_name="value_scanner_historique.xlsx",
+        data=excel_file,
 
-    mime=(
-        "application/vnd.openxmlformats-"
-        "officedocument.spreadsheetml.sheet"
+        file_name=(
+            "value_scanner_historique.xlsx"
+        ),
+
+        mime=(
+            "application/vnd.openxmlformats-"
+            "officedocument.spreadsheetml.sheet"
+        )
     )
-)
+
+except Exception as e:
+
+    st.warning(
+        "Export Excel temporairement indisponible."
+    )
