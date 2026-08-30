@@ -548,7 +548,7 @@ def build_planning(
                     ),
 
                 "closing_start":
-                    closing_start.to_pydatetime(),
+    closing_start,
 
                 "closing_window":
                     (
